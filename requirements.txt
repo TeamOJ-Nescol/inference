@@ -6,3 +6,5 @@ torchaudio
 websockets
 fastapi[standard]
 huggingface_hub
+supervision
+rf_detr
