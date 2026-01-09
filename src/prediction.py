@@ -66,6 +66,24 @@ def load_calibration(path: str):
         data["outer_radius"]
     )
 
+def save_calibration(
+    path: str,
+    top: Vector,
+    left: Vector,
+    right: Vector,
+    bottom: Vector,
+    outer_radius: float,
+):
+    data = {
+        "top": {"x": float(top.x), "y": float(top.y)},
+        "left": {"x": float(left.x), "y": float(left.y)},
+        "right": {"x": float(right.x), "y": float(right.y)},
+        "bottom": {"x": float(bottom.x), "y": float(bottom.y)},
+        "outer_radius": float(outer_radius),
+    }
+
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
 
 # ---- Homography mapping
 
@@ -81,6 +99,13 @@ class HomographyMapper:
     def map(self, p: Vector) -> Vector:
         src = np.array([[p.x, p.y, 1.0]], dtype=np.float32).T
         dst = self.H @ src
+        dst /= dst[2]
+        return Vector(dst[0][0], dst[1][0])
+
+    def unmap(self, p: Vector) -> Vector:
+        """Board → image"""
+        src = np.array([[p.x, p.y, 1.0]], dtype=np.float32).T
+        dst = self.H_inv @ src
         dst /= dst[2]
         return Vector(dst[0][0], dst[1][0])
 
@@ -146,6 +171,80 @@ def draw_detections(
                 2,
                 cv2.LINE_AA,
             )
+
+def _project_points(H: np.ndarray, pts_xy: np.ndarray) -> np.ndarray:
+    """
+    Projects Nx2 points with homography H.
+    Returns Nx2 float array.
+    """
+    pts = np.asarray(pts_xy, dtype=np.float32)
+    ones = np.ones((pts.shape[0], 1), dtype=np.float32)
+    pts_h = np.hstack([pts, ones])  # Nx3
+
+    dst_h = (H @ pts_h.T).T  # Nx3
+    dst_h[:, 0] /= dst_h[:, 2]
+    dst_h[:, 1] /= dst_h[:, 2]
+    return dst_h[:, :2]
+
+
+def draw_calibration(
+    frame,
+    top: Vector,
+    left: Vector,
+    right: Vector,
+    bottom: Vector,
+    outer_radius: float,
+    mapper,  # HomographyMapper (needs .H)
+    ring_color=(255, 0, 0),
+    ring_thickness=2,
+    ring_segments=180,
+):
+    """
+    Draw calibration landmarks + estimated board geometry.
+    Outer ring is drawn as the projection of a board-plane circle (radius=outer_radius)
+    through the inverse homography, matching the scoring space.
+    """
+
+    pts = {"T": top, "L": left, "R": right, "B": bottom}
+
+    # Draw cardinal points (red)
+    for label, p in pts.items():
+        cv2.circle(frame, (int(p.x), int(p.y)), 6, (0, 0, 255), -1)
+        cv2.putText(
+            frame, label,
+            (int(p.x) + 6, int(p.y) - 6),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+            (0, 0, 255), 2
+        )
+
+    # --- Project board-plane center (0,0) and outer circle back into image ---
+    Hinv = np.linalg.inv(mapper.H)
+
+    # Center in image = projection of board origin
+    c_img = _project_points(Hinv, np.array([[0.0, 0.0]], dtype=np.float32))[0]
+    cx, cy = int(round(c_img[0])), int(round(c_img[1]))
+
+    # Center point (blue)
+    cv2.circle(frame, (cx, cy), 6, (255, 0, 0), -1)
+    cv2.putText(
+        frame, "C",
+        (cx + 6, cy - 6),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+        (255, 0, 0), 2
+    )
+
+    # Sample points on board-plane circle: (R cos t, R sin t)
+    thetas = np.linspace(0, 2 * np.pi, ring_segments, endpoint=False, dtype=np.float32)
+    circle_board = np.stack(
+        [outer_radius * np.cos(thetas), outer_radius * np.sin(thetas)],
+        axis=1
+    )  # Nx2
+
+    circle_img = _project_points(Hinv, circle_board)  # Nx2 float
+
+    # Convert to polyline points and draw (this will look like an ellipse if tilted)
+    poly = np.round(circle_img).astype(np.int32).reshape(-1, 1, 2)
+    cv2.polylines(frame, [poly], isClosed=True, color=ring_color, thickness=ring_thickness)
 
 
 # ---- Orchestration

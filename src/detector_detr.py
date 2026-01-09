@@ -2,8 +2,39 @@ from typing import List, Tuple
 from PIL import Image
 import supervision as sv
 
+from helpers.logger import logger
 from helpers.vect import Vector
-from rf_detr.rfdetr import RFDETRSmall
+from helpers.points_order import order_calibration_points
+from rfdetr import RFDETRSmall
+
+import math
+import itertools
+
+"""
+def order_calibration_points(points: list[Vector]) -> tuple[Vector, Vector, Vector, Vector]:
+    ""
+    Orders 4 corner points as: (top_left, top_right, bottom_right, bottom_left)
+    ""
+    if len(points) != 4:
+        raise RuntimeError("Expected exactly 4 calibration points")
+
+    # For image coords: x right, y down
+    sums = [(p.x + p.y, p) for p in points]
+    diffs = [(p.x - p.y, p) for p in points]
+
+    top_left = min(sums, key=lambda t: t[0])[1]
+    bottom_right = max(sums, key=lambda t: t[0])[1]
+    top_right = max(diffs, key=lambda t: t[0])[1]
+    bottom_left = min(diffs, key=lambda t: t[0])[1]
+
+    ordered = (top_left, top_right, bottom_right, bottom_left)
+
+    if len({id(p) for p in ordered}) != 4:
+        raise RuntimeError("Calibration points are not uniquely identifiable")
+
+    return ordered
+"""
+
 
 
 class DetrDartDetector:
@@ -34,15 +65,30 @@ class DetrDartDetector:
         # Uncomment once tensor shape issue is resolved
         # self.model.optimize_for_inference()
 
-    def detect(self, image: Image.Image) -> sv.Detections:
+    # ------------------------------------------------------------
+    # Public API required by DartDetector
+    # ------------------------------------------------------------
+    def detect(self, frame) -> List[Vector]:
         """
-        Run inference and return raw Supervision Detections.
+        `frame` can be a NumPy array (OpenCV) or PIL.Image.
+        Always returns a list of Vector(x, y) *centres* of dart tips.
         """
+        if not isinstance(frame, Image.Image):
+            frame = Image.fromarray(frame[..., ::-1])  # BGR → RGB
+
         detections = self.model.predict(
-            image,
+            frame,
             threshold=self.confidence_threshold,
         )
-        return detections
+
+        dart_vectors: List[Vector] = []
+        for xyxy, cid in zip(detections.xyxy, detections.class_id):
+            if self.class_names[cid] != "dart_tip":
+                continue
+            x1, y1, x2, y2 = xyxy
+            dart_vectors.append(Vector((x1 + x2) / 2, (y1 + y2) / 2))
+
+        return dart_vectors
 
     def detect_dart_tips(self, image: Image.Image) -> List[Vector]:
         """
@@ -112,3 +158,35 @@ class DetrDartDetector:
         )
         return annotated
 
+    def calibrate(self, image: Image.Image) -> List[Vector]:
+        """
+        Detects board alignment markers and returns them as:
+        [top, left, right, bottom]
+
+        Raises:
+            RuntimeError if calibration markers are missing or ambiguous.
+        """
+        detections = self.model.predict(
+            image,
+            threshold=self.confidence_threshold,
+        )
+
+        points: List[Vector] = []
+
+        for xyxy, cid in zip(detections.xyxy, detections.class_id):
+            if self.class_names[cid] != "align":
+                continue
+
+            x1, y1, x2, y2 = xyxy
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
+            points.append(Vector(cx, cy))
+
+        if len(points) != 4:
+            raise RuntimeError(
+                f"Expected 4 calibration points, got {len(points)}"
+            )
+
+        ordered = order_calibration_points(points)
+
+        return ordered
