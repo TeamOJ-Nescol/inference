@@ -87,7 +87,6 @@ def save_calibration(
 
 # ---- Homography mapping
 
-
 import cv2
 import numpy as np
 from helpers.vect import Vector
@@ -112,30 +111,42 @@ class HomographyMapper:
     @staticmethod
     def from_calibration(
         top: Vector,
-        left: Vector,
         right: Vector,
         bottom: Vector,
+        left: Vector,
         outer_radius: float
     ):
+        # image points (order does not matter as long as it matches angles)
         image_pts = np.array([
             [top.x, top.y],
-            [left.x, left.y],
             [right.x, right.y],
-            [bottom.x, bottom.y]
+            [bottom.x, bottom.y],
+            [left.x, left.y],
         ], dtype=np.float32)
+
+        # measured real board angles (left = 0°)
+        angles_deg = [
+            81,   # top
+            189,  # right
+            261,  # bottom
+            9,    # left
+        ]
 
         board_pts = np.array([
-            [0, -outer_radius],
-            [-outer_radius, 0],
-            [outer_radius, 0],
-            [0, outer_radius]
+            [
+                outer_radius * math.cos(math.radians(a)),
+                outer_radius * math.sin(math.radians(a)),
+            ]
+            for a in angles_deg
         ], dtype=np.float32)
 
-        H, _ = cv2.findHomography(image_pts, board_pts, cv2.RANSAC, 5.0)
+        H, _ = cv2.findHomography(image_pts, board_pts, cv2.RANSAC, 3.0)
         if H is None:
             raise RuntimeError("Homography computation failed")
 
-        return HomographyMapper(H)
+        mapper = HomographyMapper(H)
+        mapper.H_inv = np.linalg.inv(H)
+        return mapper
 
 # ---- Debug display
 import cv2
