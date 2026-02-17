@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from PIL import Image
 import supervision as sv
 
@@ -50,8 +50,8 @@ class DetrDartDetector:
         self,
         checkpoint_path: str,
         confidence_threshold: float = 0.5,
-        class_names: List[str] | None = None,
-        device: str | None = None,
+        class_names: Optional[List[str]] = None,
+        device: Optional[str] = None,
     ):
         self.confidence_threshold = confidence_threshold
         self.class_names = class_names or self.DEFAULT_CLASSES

@@ -8,3 +8,4 @@ fastapi[standard]
 huggingface_hub
 supervision
 peft
+scipy

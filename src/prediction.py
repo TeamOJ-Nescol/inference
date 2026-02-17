@@ -1,5 +1,6 @@
 #!prediction.py
 
+from typing import Optional
 from helpers.logger import logger
 
 # ---- Board-specific logic + scoring
@@ -156,7 +157,7 @@ def draw_detections(
     frame,
     detected_darts: list[Vector],
     new_darts: list[Vector],
-    scores: list[tuple[int, str]] | None = None
+    scores: Optional[list[tuple[int, str]]] = None
 ):
     """
     Draws detection + scoring overlays on frame (in-place).
