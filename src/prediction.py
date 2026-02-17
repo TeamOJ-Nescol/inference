@@ -1,11 +1,14 @@
-#!prediction.py
-
 from typing import Optional
 from helpers.logger import logger
-
-# ---- Board-specific logic + scoring
-
+import json
 import math
+from helpers.vect import Vector
+import cv2
+import numpy as np
+from helpers.vect import Vector
+from helpers.vect import Vector
+from darttracker import DartTracker
+import cv2
 from helpers.vect import Vector
 
 class Dartboard:
@@ -50,11 +53,6 @@ class Dartboard:
             return number, str(number)
         return number * 2, f"D{number}"
 
-
-# ---- Calibration handling
-
-import json
-
 def load_calibration(path: str):
     with open(path, "r") as f:
         data = json.load(f)
@@ -85,12 +83,6 @@ def save_calibration(
 
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
-
-# ---- Homography mapping
-
-import cv2
-import numpy as np
-from helpers.vect import Vector
 
 class HomographyMapper:
     def __init__(self, H: np.ndarray):
@@ -148,10 +140,6 @@ class HomographyMapper:
         mapper = HomographyMapper(H)
         mapper.H_inv = np.linalg.inv(H)
         return mapper
-
-# ---- Debug display
-import cv2
-from helpers.vect import Vector
 
 def draw_detections(
     frame,
@@ -258,21 +246,12 @@ def draw_calibration(
     poly = np.round(circle_img).astype(np.int32).reshape(-1, 1, 2)
     cv2.polylines(frame, [poly], isClosed=True, color=ring_color, thickness=ring_thickness)
 
-
-# ---- Orchestration
-
-from helpers.vect import Vector
-from darttracker import DartTracker
-from detector import DartDetector
-
 class Prediction:
     def __init__(
         self,
-        detector: DartDetector,
         mapper: HomographyMapper,
         board: Dartboard
     ):
-        self.detector = detector
         self.mapper = mapper
         self.board = board
 
@@ -306,8 +285,6 @@ class Prediction:
             scores.append(score)
             tracker.mark_as_scored(dart)
 
-        #!TODO make this optional
-        # ---- DRAW OVERLAYS
         draw_detections(
             frame=frame,
             detected_darts=darts,
@@ -316,7 +293,6 @@ class Prediction:
         )
         logger.info(f"Annotated frame mean: {frame.mean()}")
         return frame, scores
-
 
     def reset_camera(self, cam_id: int):
         self.trackers.pop(cam_id, None)

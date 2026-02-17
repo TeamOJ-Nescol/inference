@@ -1,19 +1,18 @@
 from typing import Tuple
 from fastapi import FastAPI, WebSocket, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 import json
 from src.dataclass.dartboard import DartboardScorer
 import numpy as np
 import cv2
 import math
+import traceback
 
 from camera import Camera
 from helpers.filter import filter_reasonable_scores
 from helpers.logger import logger
-from helpers.vect import Vector
-import os
-from pathlib import Path
 
-from prediction import Prediction, Dartboard, HomographyMapper, save_calibration, draw_calibration
+from prediction import Prediction, Dartboard, HomographyMapper, draw_calibration
 from detector_detr import DetrDartDetector
 
 class FramePredict:
@@ -66,36 +65,69 @@ class FramePredict:
         return annotated_frame, scores
 
 
-# -------------------------------------------------------------------
 # App setup
-# -------------------------------------------------------------------
 
 app = FastAPI()
+
+# Configure CORS to allow WebSocket connections from frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:3001", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 MODEL_DIR = "/Users/struanmclean/Documents/SpazzyDarts/model/checkpoint_best_ema.pth"
 predicter = FramePredict(str(MODEL_DIR))
 
 
-# -------------------------------------------------------------------
 # WebSocket: frame-based inference
-# -------------------------------------------------------------------
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
+    client_host = websocket.client.host if websocket.client else "unknown"
+    logger.info(f"WebSocket connection attempt from {client_host}")
+    logger.info(f"Headers: {dict(websocket.headers)}")
+
+    try:
+        await websocket.accept()
+        logger.info(f"WebSocket connection accepted from {client_host}")
+    except Exception as e:
+        logger.error(f"Failed to accept WebSocket connection: {e}")
+        return
+
+    # Receive initial metadata to get camera ID
+    try:
+        data = await websocket.receive_text()
+        meta = json.loads(data)
+        cam_id = meta.get("cam_id", 0)
+        logger.info(f"Client requested camera ID: {cam_id}")
+    except Exception as e:
+        logger.error(f"Failed to receive camera metadata: {e}")
+        cam_id = 0
+
+    # Initialize camera
+    camera = None
+    try:
+        logger.info(f"Initializing camera {cam_id}...")
+        camera = Camera(cam_id)
+        logger.info(f"Camera {cam_id} initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize camera {cam_id}: {e}")
+        await websocket.send_json({"type": "error", "message": f"Failed to initialize camera: {str(e)}"})
+        return
 
     try:
         while True:
-            meta = json.loads(await websocket.receive_text())
-            cam_id = meta.get("cam_id", 0)
+            # Capture frame from camera
+            frame = camera.get_cur_frame()
+            if frame is None:
+                logger.warning("Failed to capture frame")
+                await websocket.send_json({"type": "error", "message": "Failed to capture frame"})
+                continue
 
-            frame_bytes = await websocket.receive_bytes()
-            frame = cv2.imdecode(
-                np.frombuffer(frame_bytes, np.uint8),
-                cv2.IMREAD_COLOR
-            )
-            frame = cv2.resize(frame, (640, 480))
-
+            # Process frame
             try:
                 annotated_frame, scores = predicter.main(frame, cam_id)
             except Exception as e:
@@ -103,23 +135,32 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "message": str(e)})
                 continue
 
+            # Send annotated frame
             ok, jpg = cv2.imencode(".jpg", annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             if ok:
                 await websocket.send_bytes(jpg.tobytes())
 
+            # Send scores
+            filtered_scores = filter_reasonable_scores(scores)
             await websocket.send_json({
                 "type": "scores",
                 "cam_id": cam_id,
-                "scores": filter_reasonable_scores(scores)
+                "scores": filtered_scores
             })
 
+            if filtered_scores:
+                logger.info(f"Detected scores: {filtered_scores}")
+
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error from {client_host}: {type(e).__name__}: {e}")
+        logger.error(traceback.format_exc())
+    finally:
+        if camera:
+            logger.info(f"Releasing camera {cam_id}")
+            camera.cam.release()
 
 
-# -------------------------------------------------------------------
 # HTTP: single-frame inference
-# -------------------------------------------------------------------
 
 @app.post("/frame/{cam_id}")
 async def upload_frame(cam_id: int, file: UploadFile = File(...)):
@@ -132,9 +173,7 @@ async def upload_frame(cam_id: int, file: UploadFile = File(...)):
     return {"scores": filter_reasonable_scores(scores)}
 
 
-# -------------------------------------------------------------------
 # Health check
-# -------------------------------------------------------------------
 
 @app.get("/")
 async def root():
