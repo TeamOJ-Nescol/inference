@@ -1,6 +1,7 @@
-from typing import Tuple
+from pathlib import Path
 from fastapi import FastAPI, WebSocket, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+import os
 import json
 from src.dataclass.dartboard import DartboardScorer
 import numpy as np
@@ -78,8 +79,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL_DIR = "/Users/struanmclean/Documents/SpazzyDarts/model/checkpoint_best_ema.pth"
-predicter = FramePredict(str(MODEL_DIR))
+ROOT_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_MODEL_PATH = ROOT_DIR / "model" / "checkpoint_best_ema.pth"
+MODEL_PATH = Path(os.environ.get("MODEL_PATH", DEFAULT_MODEL_PATH)).expanduser()
+
+if not MODEL_PATH.exists():
+    raise RuntimeError(
+        "Model checkpoint not found. Set MODEL_PATH or place the checkpoint at "
+        f"{DEFAULT_MODEL_PATH}"
+    )
+
+predicter = FramePredict(str(MODEL_PATH))
 
 
 # WebSocket: frame-based inference

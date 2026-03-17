@@ -249,9 +249,11 @@ def draw_calibration(
 class Prediction:
     def __init__(
         self,
+        detector,
         mapper: HomographyMapper,
         board: Dartboard
     ):
+        self.detector = detector
         self.mapper = mapper
         self.board = board
 
