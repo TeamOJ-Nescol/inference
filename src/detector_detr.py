@@ -164,29 +164,59 @@ class DetrDartDetector:
         [top, left, right, bottom]
 
         Raises:
-            RuntimeError if calibration markers are missing or ambiguous.
+            RuntimeError if fewer than 4 calibration markers are detected.
+
+        If more than 4 candidates are detected (common after lens
+        undistortion or with overlapping DETR proposals), near-duplicates
+        are merged and the 4 highest-confidence remaining points are used.
         """
         detections = self.model.predict(
             image,
             threshold=self.confidence_threshold,
         )
 
-        points: List[Vector] = []
-
-        for xyxy, cid in zip(detections.xyxy, detections.class_id):
+        # Collect (confidence, Vector) pairs for every "align" detection.
+        candidates: List[Tuple[float, Vector]] = []
+        for xyxy, cid, conf in zip(
+            detections.xyxy, detections.class_id, detections.confidence
+        ):
             if self.class_names[cid] != "align":
                 continue
-
             x1, y1, x2, y2 = xyxy
-            cx = (x1 + x2) / 2
-            cy = (y1 + y2) / 2
-            points.append(Vector(cx, cy))
-
-        if len(points) != 4:
-            raise RuntimeError(
-                f"Expected 4 calibration points, got {len(points)}"
+            candidates.append(
+                (float(conf), Vector((x1 + x2) / 2, (y1 + y2) / 2))
             )
 
-        ordered = order_calibration_points(points)
+        if len(candidates) < 4:
+            raise RuntimeError(
+                f"Expected at least 4 calibration points, got {len(candidates)}"
+            )
+
+        # Sort by confidence descending.
+        candidates.sort(key=lambda t: t[0], reverse=True)
+
+        # De-duplicate: if a candidate is within `merge_dist_px` of an already
+        # accepted (higher-confidence) point, drop it. This collapses
+        # overlapping DETR proposals pointing at the same physical marker.
+        merge_dist_px = 30.0
+        merge_dist_sq = merge_dist_px * merge_dist_px
+        kept: List[Vector] = []
+        for _conf, p in candidates:
+            if all(
+                (p.x - q.x) ** 2 + (p.y - q.y) ** 2 > merge_dist_sq
+                for q in kept
+            ):
+                kept.append(p)
+            if len(kept) == 4:
+                break
+
+        if len(kept) < 4:
+            raise RuntimeError(
+                f"Expected 4 distinct calibration points, "
+                f"got {len(kept)} after de-duplication "
+                f"(from {len(candidates)} raw detections)"
+            )
+
+        ordered = order_calibration_points(kept)
 
         return ordered

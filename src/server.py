@@ -32,6 +32,65 @@ class FramePredict:
 
         self.predictor = None
 
+        # --- Tunable lens-undistortion parameters ---
+        #
+        # No real camera calibration: we approximate the lens with a simple
+        # pinhole + radial (k1, k2) model. Iterate on these via env vars:
+        #
+        #   CAM_FOV_DEG  horizontal FOV in degrees  (default 90)
+        #   CAM_K1       1st radial coeff           (default 0, no correction)
+        #   CAM_K2       2nd radial coeff           (default 0, no correction)
+        #
+        # Sign convention matches cv2.undistort: negative k1 corrects visible
+        # barrel distortion. Start from zero and nudge k1 more negative in
+        # steps of ~0.05 until the ceiling / wall edges look straight in the
+        # rectified feed, then refine with k2. FOV mostly controls overall
+        # scale of the correction; leave it alone until k1/k2 are close.
+        self._fov_deg = float(os.environ.get("CAM_FOV_DEG", "90"))
+        self._k1 = float(os.environ.get("CAM_K1", "0.0"))
+        self._k2 = float(os.environ.get("CAM_K2", "0.0"))
+        logger.info(
+            f"Lens undistortion params: FOV={self._fov_deg}°, "
+            f"k1={self._k1}, k2={self._k2}"
+        )
+
+        # Cached per-frame-size undistort maps
+        self._undistort_size = None
+        self._undistort_map1 = None
+        self._undistort_map2 = None
+
+    def _prepare_undistort(self, w: int, h: int):
+        if self._undistort_size == (w, h) and self._undistort_map1 is not None:
+            return
+        fov_rad = math.radians(self._fov_deg)
+        fx = w / (2.0 * math.tan(fov_rad / 2.0))
+        fy = fx  # assume square pixels
+        cx, cy = w / 2.0, h / 2.0
+        K = np.array(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64
+        )
+        D = np.array([self._k1, self._k2, 0.0, 0.0, 0.0], dtype=np.float64)
+        # alpha=1 keeps the full field with black corners allowed, so you can
+        # visually judge whether the correction is actually rectifying the
+        # image. Switch to 0 once the k1/k2 values are locked in if you want
+        # to crop the black borders away.
+        new_K, _ = cv2.getOptimalNewCameraMatrix(K, D, (w, h), alpha=1)
+        self._undistort_map1, self._undistort_map2 = cv2.initUndistortRectifyMap(
+            K, D, None, new_K, (w, h), cv2.CV_16SC2
+        )
+        self._undistort_size = (w, h)
+
+    def _undistort(self, frame):
+        h, w = frame.shape[:2]
+        self._prepare_undistort(w, h)
+        return cv2.remap(
+            frame,
+            self._undistort_map1,
+            self._undistort_map2,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+        )
+
     def _build_predictor(self, top, left, right, bottom, outer_radius):
         mapper = HomographyMapper.from_calibration(
             top=top, left=left, right=right, bottom=bottom, outer_radius=outer_radius,
@@ -40,18 +99,22 @@ class FramePredict:
         return mapper
 
     def main(self, frame, cam_id: int):
+        # Undistort first: the homography is a pinhole projective model, so
+        # any residual radial lens distortion causes the projected scoring
+        # plane to agree with the calibration points but deviate everywhere
+        # else. Doing this before detection+calibration makes every downstream
+        # step operate in the (approximately) rectified pinhole view.
+        frame = self._undistort(frame)
+
         # Calibrate on every frame
         top, left, right, bottom = self.detector.calibrate(frame)
 
-        cx = (left.x + right.x) / 2
-        cy = (top.y + bottom.y) / 2
-        radii = [
-            math.hypot(top.x    - cx, top.y    - cy),
-            math.hypot(bottom.x - cx, bottom.y - cy),
-            math.hypot(left.x   - cx, left.y   - cy),
-            math.hypot(right.x  - cx, right.y  - cy),
-        ]
-        outer_radius = sum(radii) / len(radii)
+        # The alignment markers sit on the outer edge of the double ring, so
+        # the board-plane radius they correspond to is exactly
+        # `double_outer_radius`. Using this value (rather than an average of
+        # pixel distances) keeps the homography consistent with the fixed
+        # scoring thresholds in `Dartboard`.
+        outer_radius = float(DartboardScorer.double_outer_radius)
 
         mapper = self._build_predictor(top, left, right, bottom, outer_radius)
 
@@ -61,7 +124,8 @@ class FramePredict:
             frame=annotated_frame,
             top=top, left=left, right=right, bottom=bottom,
             outer_radius=outer_radius,
-            mapper=mapper
+            mapper=mapper,
+            board=self.board,
         )
 
         return annotated_frame, scores

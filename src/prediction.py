@@ -117,7 +117,12 @@ class HomographyMapper:
             [left.x, left.y],
         ], dtype=np.float32)
 
-        # measured real board angles (left = 0°)
+        # Board-plane angles for each image-labelled calibration marker.
+        #
+        # Keep this correspondence consistent with `order_calibration_points`
+        # output ordering: [top, right, bottom, left]. Changing this mapping
+        # to camera-pose-specific assumptions can introduce a skewed board
+        # projection even when the 4 detected image points are correct.
         angles_deg = [
             81,   # top
             189,  # right
@@ -133,7 +138,10 @@ class HomographyMapper:
             for a in angles_deg
         ], dtype=np.float32)
 
-        H, _ = cv2.findHomography(image_pts, board_pts, cv2.RANSAC, 3.0)
+        # With exactly 4 correspondences, use the direct 4-point solver.
+        # `findHomography(..., RANSAC, 3.0)` can mark a valid point an outlier
+        # and return a degenerate fit when only 4 points are available.
+        H = cv2.getPerspectiveTransform(image_pts, board_pts)
         if H is None:
             raise RuntimeError("Homography computation failed")
 
@@ -198,6 +206,7 @@ def draw_calibration(
     ring_color=(255, 0, 0),
     ring_thickness=2,
     ring_segments=180,
+    board: Optional["Dartboard"] = None,
 ):
     """
     Draw calibration landmarks + estimated board geometry.
@@ -207,13 +216,21 @@ def draw_calibration(
 
     pts = {"T": top, "L": left, "R": right, "B": bottom}
 
-    # Draw cardinal points (red)
+    # Draw cardinal points (red, with white outline + large label for visibility)
     for label, p in pts.items():
-        cv2.circle(frame, (int(p.x), int(p.y)), 6, (0, 0, 255), -1)
+        cx_p, cy_p = int(p.x), int(p.y)
+        cv2.circle(frame, (cx_p, cy_p), 12, (255, 255, 255), 2)  # white halo
+        cv2.circle(frame, (cx_p, cy_p), 8, (0, 0, 255), -1)      # red dot
         cv2.putText(
             frame, label,
-            (int(p.x) + 6, int(p.y) - 6),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+            (cx_p + 12, cy_p - 12),
+            cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+            (255, 255, 255), 4
+        )
+        cv2.putText(
+            frame, label,
+            (cx_p + 12, cy_p - 12),
+            cv2.FONT_HERSHEY_SIMPLEX, 1.0,
             (0, 0, 255), 2
         )
 
@@ -235,16 +252,26 @@ def draw_calibration(
 
     # Sample points on board-plane circle: (R cos t, R sin t)
     thetas = np.linspace(0, 2 * np.pi, ring_segments, endpoint=False, dtype=np.float32)
-    circle_board = np.stack(
-        [outer_radius * np.cos(thetas), outer_radius * np.sin(thetas)],
-        axis=1
-    )  # Nx2
 
-    circle_img = _project_points(Hinv, circle_board)  # Nx2 float
+    def _draw_ring(radius, color, thickness=ring_thickness):
+        pts_board = np.stack(
+            [radius * np.cos(thetas), radius * np.sin(thetas)], axis=1
+        )
+        pts_img = _project_points(Hinv, pts_board)
+        poly = np.round(pts_img).astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(frame, [poly], isClosed=True, color=color, thickness=thickness)
 
-    # Convert to polyline points and draw (this will look like an ellipse if tilted)
-    poly = np.round(circle_img).astype(np.int32).reshape(-1, 1, 2)
-    cv2.polylines(frame, [poly], isClosed=True, color=ring_color, thickness=ring_thickness)
+    # Calibration / outer ring (this should trace the outer edge of the double ring)
+    _draw_ring(outer_radius, ring_color, ring_thickness)
+
+    # Additional scoring bands, if the Dartboard is provided. These let you
+    # visually compare the resolved scoring plane against the physical board.
+    if board is not None:
+        _draw_ring(board.double_inner_radius,  (0, 255, 255))  # yellow
+        _draw_ring(board.treble_outer_radius,  (0, 255,   0))  # green
+        _draw_ring(board.treble_inner_radius,  (0, 255,   0))  # green
+        _draw_ring(board.bull_radius,          (0, 165, 255))  # orange
+        _draw_ring(board.double_bull_radius,   (0,   0, 255))  # red
 
 class Prediction:
     def __init__(
@@ -275,7 +302,13 @@ class Prediction:
 
         h, w = frame.shape[:2]
         logger.info(f"Frame shape: {w}x{h}")
-        frame = cv2.resize(frame, (640, 480))
+        # NOTE: do NOT resize here. The homography is built from calibration
+        # points detected in the original frame (see FramePredict.main), so the
+        # mapper expects dart detections and overlay drawing to stay in that
+        # same pixel space. Resizing only the frame — while leaving the
+        # calibration points and mapper at the original resolution — shifted
+        # the projected board centroid off-image and scaled scoring by the
+        # resize factor.
 
         darts = self.detector.detect(frame)
         new_darts = tracker.update(darts)
