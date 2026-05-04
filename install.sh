@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
 PYTHON_BIN=""
-for candidate in python3.12 python3.11 python3.10; do
+for candidate in python3.12 python3.13 python3.14 python3.11 python3.10; do
   if command -v "$candidate" >/dev/null 2>&1; then
     PYTHON_BIN="$candidate"
     break
