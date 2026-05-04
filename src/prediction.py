@@ -10,11 +10,11 @@ from helpers.vect import Vector
 from darttracker import DartTracker
 import cv2
 from helpers.vect import Vector
+from dataclass.dartboard import DartboardScorer
+
+DARTS_PER_ROUND = 3
 
 class Dartboard:
-    NUMBERS = [20, 1, 18, 4, 13, 6, 10, 15, 2, 17,
-               3, 19, 7, 16, 8, 11, 14, 9, 12, 5]
-
     def __init__(
         self,
         bull_radius: float,
@@ -37,9 +37,12 @@ class Dartboard:
         if r > self.double_outer_radius:
             return 0, "Miss"
 
-        angle = (90 - math.degrees(math.atan2(-p.y, p.x))) % 360
+        angle = math.degrees(math.atan2(-p.y, p.x))
+        angle = (90 - angle) % 360
+        angle = (angle + 9) % 360 
+
         index = int(angle // 18) % 20
-        number = self.NUMBERS[index]
+        number = DartboardScorer.dartboard_numbers[index]
 
         if r <= self.double_bull_radius:
             return 50, "Double Bull"
@@ -109,39 +112,28 @@ class HomographyMapper:
         left: Vector,
         outer_radius: float
     ):
-        # image points (order does not matter as long as it matches angles)
-        image_pts = np.array([
-            [top.x, top.y],
-            [right.x, right.y],
-            [bottom.x, bottom.y],
-            [left.x, left.y],
-        ], dtype=np.float32)
+        angles = DartboardScorer.calibration_angles
+        markers = [top, right, bottom, left]
 
-        # Board-plane angles for each image-labelled calibration marker.
-        #
-        # Keep this correspondence consistent with `order_calibration_points`
-        # output ordering: [top, right, bottom, left]. Changing this mapping
-        # to camera-pose-specific assumptions can introduce a skewed board
-        # projection even when the 4 detected image points are correct.
-        angles_deg = [
-            81,   # top
-            189,  # right
-            261,  # bottom
-            9,    # left
-        ]
+        image_pts = np.array(
+            [[p.x, p.y] for p in markers],
+            dtype=np.float32,
+        )
 
-        board_pts = np.array([
+        # Compass angle θ → board (x, y) with +x right, +y down, θ=0 at top.
+        board_pts = np.array(
             [
-                outer_radius * math.cos(math.radians(a)),
-                outer_radius * math.sin(math.radians(a)),
-            ]
-            for a in angles_deg
-        ], dtype=np.float32)
+                [
+                    outer_radius * math.sin(math.radians(a)),
+                    -outer_radius * math.cos(math.radians(a)),
+                ]
+                for a in angles
+            ],
+            dtype=np.float32,
+        )
 
-        # With exactly 4 correspondences, use the direct 4-point solver.
-        # `findHomography(..., RANSAC, 3.0)` can mark a valid point an outlier
-        # and return a degenerate fit when only 4 points are available.
-        H = cv2.getPerspectiveTransform(image_pts, board_pts)
+        H, _ = cv2.findHomography(image_pts, board_pts, cv2.RANSAC, 5.0)
+
         if H is None:
             raise RuntimeError("Homography computation failed")
 
@@ -286,48 +278,82 @@ class Prediction:
 
         # one tracker per camera
         self.trackers = {}
+        # per-camera round state: {"scores": [...], "locked": bool}
+        self.rounds = {}
 
     def _get_tracker(self, cam_id: int) -> DartTracker:
         if cam_id not in self.trackers:
             self.trackers[cam_id] = DartTracker()
         return self.trackers[cam_id]
 
+    def _get_round(self, cam_id: int) -> dict:
+        if cam_id not in self.rounds:
+            self.rounds[cam_id] = {"scores": [], "locked": False}
+        return self.rounds[cam_id]
+
     def process_frame(self, frame, cam_id: int):
-        """
-        Returns:
-            annotated_frame,
-            List[(score:int, label:str)]
-        """
         tracker = self._get_tracker(cam_id)
+        round_state = self._get_round(cam_id)
 
         h, w = frame.shape[:2]
         logger.info(f"Frame shape: {w}x{h}")
-        # NOTE: do NOT resize here. The homography is built from calibration
-        # points detected in the original frame (see FramePredict.main), so the
-        # mapper expects dart detections and overlay drawing to stay in that
-        # same pixel space. Resizing only the frame — while leaving the
-        # calibration points and mapper at the original resolution — shifted
-        # the projected board centroid off-image and scaled scoring by the
-        # resize factor.
 
         darts = self.detector.detect(frame)
         new_darts = tracker.update(darts)
 
-        scores = []
-        for dart in new_darts:
-            board_pt = self.mapper.map(dart)
-            score = self.board.score(board_pt)
-            scores.append(score)
-            tracker.mark_as_scored(dart)
+        new_scores = []
+
+        # store scored dart positions (per camera)
+        if not hasattr(self, "scored_positions"):
+            self.scored_positions = {}
+
+        if cam_id not in self.scored_positions:
+            self.scored_positions[cam_id] = []
+
+        scored_positions = self.scored_positions[cam_id]
+
+        def is_duplicate(pos: Vector, threshold: float = 20.0) -> bool:
+            for p in scored_positions:
+                if math.hypot(p.x - pos.x, p.y - pos.y) < threshold:
+                    return True
+            return False
+
+        if not round_state["locked"]:
+            for dart in new_darts:
+                board_pt = self.mapper.map(dart)
+
+                if is_duplicate(dart):
+                    continue
+
+                score = self.board.score(board_pt)
+
+                round_state["scores"].append(score)
+                new_scores.append(score)
+
+                tracker.mark_as_scored(dart)
+
+                # remember this position so it won't be double counted
+                scored_positions.append(dart)
+
+                if len(round_state["scores"]) >= DARTS_PER_ROUND:
+                    round_state["locked"] = True
+                    break
+
+        # reset when board is empty
+        if round_state["locked"] and not tracker.tracked_darts:
+            round_state["scores"] = []
+            round_state["locked"] = False
+            self.scored_positions[cam_id] = []  # reset memory
 
         draw_detections(
             frame=frame,
             detected_darts=darts,
             new_darts=new_darts,
-            scores=scores,
+            scores=new_scores,
         )
-        logger.info(f"Annotated frame mean: {frame.mean()}")
-        return frame, scores
+
+        return frame, list(round_state["scores"])
 
     def reset_camera(self, cam_id: int):
         self.trackers.pop(cam_id, None)
+        self.rounds.pop(cam_id, None)

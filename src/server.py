@@ -19,7 +19,10 @@ from detector_detr import DetrDartDetector
 
 class FramePredict:
     def __init__(self, model_path: str):
-        self.detector = DetrDartDetector(checkpoint_path=model_path, device="cpu")
+        self.detector = DetrDartDetector(
+            checkpoint_path=model_path, 
+            device="cpu"
+        )
 
         self.board = Dartboard(
             bull_radius=DartboardScorer.bull_radius,
@@ -32,20 +35,6 @@ class FramePredict:
 
         self.predictor = None
 
-        # --- Tunable lens-undistortion parameters ---
-        #
-        # No real camera calibration: we approximate the lens with a simple
-        # pinhole + radial (k1, k2) model. Iterate on these via env vars:
-        #
-        #   CAM_FOV_DEG  horizontal FOV in degrees  (default 90)
-        #   CAM_K1       1st radial coeff           (default 0, no correction)
-        #   CAM_K2       2nd radial coeff           (default 0, no correction)
-        #
-        # Sign convention matches cv2.undistort: negative k1 corrects visible
-        # barrel distortion. Start from zero and nudge k1 more negative in
-        # steps of ~0.05 until the ceiling / wall edges look straight in the
-        # rectified feed, then refine with k2. FOV mostly controls overall
-        # scale of the correction; leave it alone until k1/k2 are close.
         self._fov_deg = float(os.environ.get("CAM_FOV_DEG", "90"))
         self._k1 = float(os.environ.get("CAM_K1", "0.0"))
         self._k2 = float(os.environ.get("CAM_K2", "0.0"))
@@ -58,6 +47,9 @@ class FramePredict:
         self._undistort_size = None
         self._undistort_map1 = None
         self._undistort_map2 = None
+
+        # Per-camera calibration cache (cam_id -> (top, left, right, bottom, mapper, outer_radius))
+        self._calibration_cache = {}
 
     def _prepare_undistort(self, w: int, h: int):
         if self._undistort_size == (w, h) and self._undistort_map1 is not None:
@@ -95,8 +87,16 @@ class FramePredict:
         mapper = HomographyMapper.from_calibration(
             top=top, left=left, right=right, bottom=bottom, outer_radius=outer_radius,
         )
-        self.predictor = Prediction(self.detector, mapper, self.board)
+        if self.predictor is None:
+            self.predictor = Prediction(self.detector, mapper, self.board)
+        else:
+            self.predictor.mapper = mapper
         return mapper
+
+    def reset_calibration(self, cam_id: int):
+        self._calibration_cache.pop(cam_id, None)
+        if self.predictor is not None:
+            self.predictor.reset_camera(cam_id)
 
     def main(self, frame, cam_id: int):
         # Undistort first: the homography is a pinhole projective model, so
@@ -106,17 +106,27 @@ class FramePredict:
         # step operate in the (approximately) rectified pinhole view.
         frame = self._undistort(frame)
 
-        # Calibrate on every frame
-        top, left, right, bottom = self.detector.calibrate(frame)
+        cached = self._calibration_cache.get(cam_id)
+        if cached is None:
+            # Calibrate once per session; the detector raises if the markers
+            # can't be located, in which case the cache stays empty and the
+            # next frame retries.
+            top, left, right, bottom = self.detector.calibrate(frame)
 
-        # The alignment markers sit on the outer edge of the double ring, so
-        # the board-plane radius they correspond to is exactly
-        # `double_outer_radius`. Using this value (rather than an average of
-        # pixel distances) keeps the homography consistent with the fixed
-        # scoring thresholds in `Dartboard`.
-        outer_radius = float(DartboardScorer.double_outer_radius)
+            # The alignment markers sit on the outer edge of the double ring, so
+            # the board-plane radius they correspond to is exactly
+            # `double_outer_radius`. Using this value (rather than an average of
+            # pixel distances) keeps the homography consistent with the fixed
+            # scoring thresholds in `Dartboard`.
+            outer_radius = float(DartboardScorer.double_outer_radius)
 
-        mapper = self._build_predictor(top, left, right, bottom, outer_radius)
+            mapper = self._build_predictor(top, left, right, bottom, outer_radius)
+            cached = (top, left, right, bottom, mapper, outer_radius)
+            self._calibration_cache[cam_id] = cached
+        else:
+            top, left, right, bottom, mapper, outer_radius = cached
+            if self.predictor is None or self.predictor.mapper is not mapper:
+                self._build_predictor(top, left, right, bottom, outer_radius)
 
         annotated_frame, scores = self.predictor.process_frame(frame, cam_id)
 
@@ -158,7 +168,6 @@ predicter = FramePredict(str(MODEL_PATH))
 
 
 # WebSocket: frame-based inference
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     client_host = websocket.client.host if websocket.client else "unknown"
@@ -242,24 +251,9 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.error(f"WebSocket error from {client_host}: {type(e).__name__}: {e}")
         logger.error(traceback.format_exc())
     finally:
-        predicter.predictor.reset_camera(cam_id) if predicter.predictor else None
-
-
-# HTTP: single-frame inference
-
-@app.post("/frame/{cam_id}")
-async def upload_frame(cam_id: int, file: UploadFile = File(...)):
-    image_bytes = await file.read()
-    frame = cv2.imdecode(
-        np.frombuffer(image_bytes, np.uint8),
-        cv2.IMREAD_COLOR
-    )
-    annotated_frame, scores = predicter.main(frame, cam_id)
-    return {"scores": filter_reasonable_scores(scores)}
-
+        predicter.reset_calibration(cam_id)
 
 # WebSocket: video file inference (OpenCV decodes server-side, bypasses browser codec limits)
-
 @app.websocket("/video/ws")
 async def video_websocket_endpoint(websocket: WebSocket):
     client_host = websocket.client.host if websocket.client else "unknown"
@@ -371,13 +365,13 @@ async def video_websocket_endpoint(websocket: WebSocket):
         except Exception:
             pass
     finally:
+        predicter.reset_calibration(cam_id)
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
             logger.info(f"Cleaned up temp video file: {tmp_path}")
 
 
 # Health check
-
 @app.get("/")
 async def root():
     return {"message": "Running"}
