@@ -16,7 +16,7 @@ class DetrDartDetector:
     def __init__(
         self,
         checkpoint_path: str,
-        confidence_threshold: float = 0.5,
+        confidence_threshold: float = 0.2,
         class_names: Optional[List[str]] = None,
         device: Optional[str] = None,
     ):

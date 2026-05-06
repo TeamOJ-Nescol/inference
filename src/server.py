@@ -99,6 +99,14 @@ class FramePredict:
             self.predictor.reset_camera(cam_id)
 
     def main(self, frame, cam_id: int):
+        # Drop colour information up front: the detector and calibration
+        # markers are shape/contrast based, and luminance-only input removes
+        # colour-cast confounders (lighting tint, board paint variation).
+        # We expand back to 3 channels so the detector (which expects
+        # 3-channel BGR/RGB) and downstream annotators continue to work.
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
         # Undistort first: the homography is a pinhole projective model, so
         # any residual radial lens distortion causes the projected scoring
         # plane to agree with the calibration points but deviate everywhere
