@@ -114,7 +114,7 @@ class FramePredict:
         # step operate in the (approximately) rectified pinhole view.
         frame = self._undistort(frame)
 
-        cached = self._calibration_cache.get(cam_id)
+        cached = None
         if cached is None:
             # Calibrate once per session; the detector raises if the markers
             # can't be located, in which case the cache stays empty and the
