@@ -22,7 +22,10 @@ from helpers.points_order import order_calibration_points
 
 class FramePredict:
     def __init__(self, model_path: str):
-        self.detector = DetrDartDetector(checkpoint_path=model_path, device="cpu")
+        self.detector = DetrDartDetector(
+            checkpoint_path=model_path, 
+            device="cpu"
+        )
 
         self.board = Dartboard(
             bull_radius=DartboardScorer.bull_radius,
@@ -37,20 +40,6 @@ class FramePredict:
         self.latest_calibrations = {}
         self.active_calibrations = {}
 
-        # --- Tunable lens-undistortion parameters ---
-        #
-        # No real camera calibration: we approximate the lens with a simple
-        # pinhole + radial (k1, k2) model. Iterate on these via env vars:
-        #
-        #   CAM_FOV_DEG  horizontal FOV in degrees  (default 90)
-        #   CAM_K1       1st radial coeff           (default 0, no correction)
-        #   CAM_K2       2nd radial coeff           (default 0, no correction)
-        #
-        # Sign convention matches cv2.undistort: negative k1 corrects visible
-        # barrel distortion. Start from zero and nudge k1 more negative in
-        # steps of ~0.05 until the ceiling / wall edges look straight in the
-        # rectified feed, then refine with k2. FOV mostly controls overall
-        # scale of the correction; leave it alone until k1/k2 are close.
         self._fov_deg = float(os.environ.get("CAM_FOV_DEG", "90"))
         self._k1 = float(os.environ.get("CAM_K1", "0.0"))
         self._k2 = float(os.environ.get("CAM_K2", "0.0"))
@@ -63,6 +52,9 @@ class FramePredict:
         self._undistort_size = None
         self._undistort_map1 = None
         self._undistort_map2 = None
+
+        # Per-camera calibration cache (cam_id -> (top, left, right, bottom, mapper, outer_radius))
+        self._calibration_cache = {}
 
     def _prepare_undistort(self, w: int, h: int):
         if self._undistort_size == (w, h) and self._undistort_map1 is not None:
@@ -214,7 +206,18 @@ class FramePredict:
         cleared = self.active_calibrations.pop(cam_key, None) is not None
         return {"cam_id": cam_key, "cleared": cleared}
 
+    def reset_calibration(self, cam_id: int):
+        self.predictor.reset_camera(cam_id)
+
     def main(self, frame, cam_id: int):
+        # Drop colour information up front: the detector and calibration
+        # markers are shape/contrast based, and luminance-only input removes
+        # colour-cast confounders (lighting tint, board paint variation).
+        # We expand back to 3 channels so the detector (which expects
+        # 3-channel BGR/RGB) and downstream annotators continue to work.
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
         # Undistort first: the homography is a pinhole projective model, so
         # any residual radial lens distortion causes the projected scoring
         # plane to agree with the calibration points but deviate everywhere
@@ -301,7 +304,6 @@ def encode_jpeg_response(frame, headers=None):
 
 
 # WebSocket: frame-based inference
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     client_host = websocket.client.host if websocket.client else "unknown"
@@ -385,21 +387,7 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.error(f"WebSocket error from {client_host}: {type(e).__name__}: {e}")
         logger.error(traceback.format_exc())
     finally:
-        predicter.predictor.reset_camera(cam_id) if predicter.predictor else None
-
-
-# HTTP: single-frame inference
-
-@app.post("/frame/{cam_id}")
-async def upload_frame(cam_id: int, file: UploadFile = File(...)):
-    image_bytes = await file.read()
-    frame = cv2.imdecode(
-        np.frombuffer(image_bytes, np.uint8),
-        cv2.IMREAD_COLOR
-    )
-    annotated_frame, scores = predicter.main(frame, cam_id)
-    return {"scores": filter_reasonable_scores(scores)}
-
+        predicter.reset_calibration(cam_id)
 
 @app.post("/calibration/frame")
 async def calibrate_frame(
@@ -438,7 +426,6 @@ async def clear_cached_calibration(cam_id: str = Form("0")):
 
 
 # WebSocket: video file inference (OpenCV decodes server-side, bypasses browser codec limits)
-
 @app.websocket("/video/ws")
 async def video_websocket_endpoint(websocket: WebSocket):
     client_host = websocket.client.host if websocket.client else "unknown"
@@ -550,13 +537,13 @@ async def video_websocket_endpoint(websocket: WebSocket):
         except Exception:
             pass
     finally:
+        predicter.reset_calibration(cam_id)
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
             logger.info(f"Cleaned up temp video file: {tmp_path}")
 
 
 # Health check
-
 @app.get("/")
 async def root():
     return {"message": "Running"}

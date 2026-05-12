@@ -14,8 +14,8 @@ class DartboardScorer:
     segment_angle = 18
 
     calibration_angles = [
-        351,  # Between 5 and 20 (20 is at 0°, 5 is at 342°, intersection at 351°)
-        171,  # Between 13 and 6 (13 is at 162°, 6 is at 180°, intersection at 171°)
-        45,   # Between 17 and 3 (3 is at 36°, 17 is at 54°, intersection at 45°)
-        189   # Between 8 and 11 (11 is at 198°, 8 is at 180°, intersection at 189°)
+        351,  # Between 20 and 5
+        99,   # Between 6 and 10
+        171,  # Between 3 and 17
+        279   # Between 11 and 14
     ]
