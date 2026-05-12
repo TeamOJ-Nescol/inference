@@ -37,6 +37,8 @@ class Dartboard:
         if r > self.double_outer_radius:
             return 0, "Miss"
 
+        # Rotate into board coordinates so 0 degrees points at 20 and the ring
+        # lookup can stay a simple 18-degree slice index.
         angle = (90 - math.degrees(math.atan2(-p.y, p.x))) % 360
         index = int(angle // 18) % 20
         number = self.NUMBERS[index]
@@ -91,6 +93,8 @@ class HomographyMapper:
     def map(self, p: Vector) -> Vector:
         src = np.array([[p.x, p.y, 1.0]], dtype=np.float32).T
         dst = self.H @ src
+        # Homogeneous projection returns an arbitrary scale; divide through to
+        # recover board-plane coordinates.
         dst /= dst[2]
         return Vector(dst[0][0], dst[1][0])
 
@@ -187,7 +191,7 @@ def _project_points(H: np.ndarray, pts_xy: np.ndarray) -> np.ndarray:
     """
     pts = np.asarray(pts_xy, dtype=np.float32)
     ones = np.ones((pts.shape[0], 1), dtype=np.float32)
-    pts_h = np.hstack([pts, ones])  # Nx3
+    pts_h = np.hstack([pts, ones])  # Nx3 homogeneous coordinates
 
     dst_h = (H @ pts_h.T).T  # Nx3
     dst_h[:, 0] /= dst_h[:, 2]

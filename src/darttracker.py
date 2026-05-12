@@ -16,6 +16,8 @@ class DartTracker:
                 (dart.x - tracked_dart.x)**2 + 
                 (dart.y - tracked_dart.y)**2
             )
+            # Mark the persisted track, not the fresh detection, so the same
+            # physical dart is not emitted again on the next frame.
             if distance <= self.distance_threshold:
                 self.tracked_darts[i] = (tracked_dart, timestamp, True)
                 break
@@ -36,6 +38,7 @@ class DartTracker:
         self.tracked_darts = [
             (dart, timestamp, scored) 
             for dart, timestamp, scored in self.tracked_darts 
+            # Expire stale tracks so a removed dart can be counted again later.
             if current_time - timestamp <= self.time_threshold
         ]
 
@@ -48,6 +51,8 @@ class DartTracker:
                     (new_dart.y - tracked_dart.y)**2
                 )
                 
+                # Nearby detections across adjacent frames are treated as the
+                # same dart until the track ages out.
                 if distance <= self.distance_threshold:
                     is_new = False
                     break

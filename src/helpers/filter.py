@@ -6,6 +6,7 @@ def filter_reasonable_scores(scores: List[tuple[int, str]]) -> List[tuple[int, s
     vaild_scores = []
 
     for score, desc in scores:
+        # Standard steel-tip darts top out at triple 20 = 60.
         if score < 0 or score > 60:
             continue
 
@@ -38,7 +39,8 @@ def compare_duo_cam(
         logger.warning("Camera 2 detected no darts, using Camera 1 results")
         return scores1
     
-    # Match
+    # Exact tuple matches are the strongest evidence because both cameras agree
+    # on both the numeric score and the ring descriptor.
     exact_matches = []
 
     scores1_set = set(scores1)
@@ -47,7 +49,8 @@ def compare_duo_cam(
     for score in scores1_set.intersection(scores2_set):
         exact_matches.append(score)
 
-    # Prefer more pesific
+    # When cameras agree on the numeric value but disagree on the descriptor,
+    # keep the more specific label (for example `D20` over `20`).
     score_matches = []
 
     for i, score1 in enumerate(scores1):
@@ -63,7 +66,8 @@ def compare_duo_cam(
 
     validated_scores = exact_matches + score_matches
 
-    # Significant dissagrement
+    # Agreement is measured against total reports, so duplicate / conflicting
+    # detections naturally lower confidence.
     total_detected = len(scores1) + len(scores2)
     agreement_ratio = len(validated_scores) / max(total_detected, 1)
 

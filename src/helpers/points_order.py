@@ -8,6 +8,8 @@ def order_calibration_points(points):
     if len(points) != 4:
         raise RuntimeError("Expected exactly 4 calibration points")
 
+    # Use the centroid so ordering stays stable regardless of the board's
+    # position inside the image frame.
     cx = sum(p.x for p in points) / 4
     cy = sum(p.y for p in points) / 4
 
@@ -15,7 +17,8 @@ def order_calibration_points(points):
         # y increases downward, so invert dy for standard math orientation
         return math.atan2(-(p.y - cy), p.x - cx)
 
-    # Sorts CCW: [Right, Top, Left, Bottom]
+    # Sort CCW in mathematical orientation first, then remap into the
+    # calibration order expected by the homography builder.
     pts = sorted(points, key=angle)
 
     # Re-assigning to shift the order 90 degrees CCW
@@ -24,4 +27,3 @@ def order_calibration_points(points):
     bottom, right, top, left = pts
 
     return top, left, right, bottom
-
