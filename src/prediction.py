@@ -195,6 +195,32 @@ def _project_points(H: np.ndarray, pts_xy: np.ndarray) -> np.ndarray:
     return dst_h[:, :2]
 
 
+def draw_calibration_points(
+    frame,
+    points: list[Vector],
+    labels: Optional[list[str]] = None,
+    point_color=(0, 0, 255),
+    text_color=(255, 255, 255),
+):
+    for i, p in enumerate(points):
+        label = labels[i] if labels and i < len(labels) else str(i + 1)
+        cx_p, cy_p = int(p.x), int(p.y)
+        cv2.circle(frame, (cx_p, cy_p), 12, (255, 255, 255), 2)
+        cv2.circle(frame, (cx_p, cy_p), 8, point_color, -1)
+        cv2.putText(
+            frame, label,
+            (cx_p + 12, cy_p - 12),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+            text_color, 3
+        )
+        cv2.putText(
+            frame, label,
+            (cx_p + 12, cy_p - 12),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+            point_color, 2
+        )
+
+
 def draw_calibration(
     frame,
     top: Vector,
@@ -214,25 +240,7 @@ def draw_calibration(
     through the inverse homography, matching the scoring space.
     """
 
-    pts = {"T": top, "L": left, "R": right, "B": bottom}
-
-    # Draw cardinal points (red, with white outline + large label for visibility)
-    for label, p in pts.items():
-        cx_p, cy_p = int(p.x), int(p.y)
-        cv2.circle(frame, (cx_p, cy_p), 12, (255, 255, 255), 2)  # white halo
-        cv2.circle(frame, (cx_p, cy_p), 8, (0, 0, 255), -1)      # red dot
-        cv2.putText(
-            frame, label,
-            (cx_p + 12, cy_p - 12),
-            cv2.FONT_HERSHEY_SIMPLEX, 1.0,
-            (255, 255, 255), 4
-        )
-        cv2.putText(
-            frame, label,
-            (cx_p + 12, cy_p - 12),
-            cv2.FONT_HERSHEY_SIMPLEX, 1.0,
-            (0, 0, 255), 2
-        )
+    draw_calibration_points(frame, [top, left, right, bottom], labels=["T", "L", "R", "B"])
 
     # --- Project board-plane center (0,0) and outer circle back into image ---
     Hinv = np.linalg.inv(mapper.H)
@@ -277,11 +285,9 @@ class Prediction:
     def __init__(
         self,
         detector,
-        mapper: HomographyMapper,
         board: Dartboard
     ):
         self.detector = detector
-        self.mapper = mapper
         self.board = board
 
         # one tracker per camera
@@ -292,7 +298,7 @@ class Prediction:
             self.trackers[cam_id] = DartTracker()
         return self.trackers[cam_id]
 
-    def process_frame(self, frame, cam_id: int):
+    def process_frame(self, frame, cam_id: int, mapper: HomographyMapper):
         """
         Returns:
             annotated_frame,
@@ -315,7 +321,7 @@ class Prediction:
 
         scores = []
         for dart in new_darts:
-            board_pt = self.mapper.map(dart)
+            board_pt = mapper.map(dart)
             score = self.board.score(board_pt)
             scores.append(score)
             tracker.mark_as_scored(dart)

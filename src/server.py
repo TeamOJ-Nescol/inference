@@ -1,10 +1,12 @@
 from pathlib import Path
-from fastapi import FastAPI, WebSocket, UploadFile, File
+from fastapi import FastAPI, WebSocket, UploadFile, File, Form, HTTPException
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import json
 import tempfile
 import asyncio
+from copy import deepcopy
 from src.dataclass.dartboard import DartboardScorer
 import numpy as np
 import cv2
@@ -14,8 +16,9 @@ import traceback
 from helpers.filter import filter_reasonable_scores
 from helpers.logger import logger
 
-from prediction import Prediction, Dartboard, HomographyMapper, draw_calibration
+from prediction import Prediction, Dartboard, HomographyMapper, draw_calibration, draw_calibration_points
 from detector_detr import DetrDartDetector
+from helpers.points_order import order_calibration_points
 
 class FramePredict:
     def __init__(self, model_path: str):
@@ -30,7 +33,9 @@ class FramePredict:
             double_outer_radius=DartboardScorer.double_outer_radius
         )
 
-        self.predictor = None
+        self.predictor = Prediction(self.detector, self.board)
+        self.latest_calibrations = {}
+        self.active_calibrations = {}
 
         # --- Tunable lens-undistortion parameters ---
         #
@@ -91,12 +96,123 @@ class FramePredict:
             borderMode=cv2.BORDER_CONSTANT,
         )
 
-    def _build_predictor(self, top, left, right, bottom, outer_radius):
-        mapper = HomographyMapper.from_calibration(
+    def _cam_key(self, cam_id) -> str:
+        return str(cam_id)
+
+    def _outer_radius(self) -> float:
+        return float(DartboardScorer.double_outer_radius)
+
+    def _build_mapper(self, top, left, right, bottom, outer_radius):
+        return HomographyMapper.from_calibration(
             top=top, left=left, right=right, bottom=bottom, outer_radius=outer_radius,
         )
-        self.predictor = Prediction(self.detector, mapper, self.board)
-        return mapper
+
+    def _annotate_status(self, frame, lines, ok=False):
+        color = (0, 180, 0) if ok else (0, 140, 255)
+        for idx, line in enumerate(lines):
+            y = 30 + (idx * 28)
+            cv2.putText(
+                frame,
+                line,
+                (16, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                (0, 0, 0),
+                5,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                frame,
+                line,
+                (16, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+
+    def _capture_calibration(self, frame, cam_id):
+        cam_key = self._cam_key(cam_id)
+        frame = self._undistort(frame)
+        calibration_points = self.detector.get_distinct_calibration_points(frame)
+        point_count = len(calibration_points)
+        outer_radius = self._outer_radius()
+
+        status = {
+            "cam_id": cam_key,
+            "points_detected": point_count,
+            "homography_ready": False,
+            "cache_active": cam_key in self.active_calibrations,
+        }
+
+        snapshot = None
+        if point_count >= 4:
+            ordered_points = order_calibration_points(calibration_points[:4])
+            top, left, right, bottom = ordered_points
+            mapper = self._build_mapper(top, left, right, bottom, outer_radius)
+            snapshot = {
+                "mapper": mapper,
+                "outer_radius": outer_radius,
+                "points": [deepcopy(p) for p in ordered_points],
+            }
+            self.latest_calibrations[cam_key] = snapshot
+            status["homography_ready"] = True
+
+        annotated_frame = frame.copy()
+
+        if point_count > 0:
+            draw_calibration_points(annotated_frame, calibration_points)
+
+        if snapshot is None:
+            self._annotate_status(
+                annotated_frame,
+                [
+                    f"Calibration markers found: {point_count}/4",
+                    "Need 4 distinct markers to solve homography",
+                ],
+            )
+            return annotated_frame, status
+
+        top, left, right, bottom = snapshot["points"]
+        mapper = snapshot["mapper"]
+
+        draw_calibration(
+            frame=annotated_frame,
+            top=top,
+            left=left,
+            right=right,
+            bottom=bottom,
+            outer_radius=outer_radius,
+            mapper=mapper,
+            board=self.board,
+        )
+        self._annotate_status(
+            annotated_frame,
+            [
+                f"Calibration markers found: {point_count}",
+                "Homography ready for caching",
+            ],
+            ok=True,
+        )
+        return annotated_frame, status
+
+    def cache_latest_homography(self, cam_id):
+        cam_key = self._cam_key(cam_id)
+        latest = self.latest_calibrations.get(cam_key)
+        if latest is None:
+            raise RuntimeError("No successful calibration is available to cache")
+        self.active_calibrations[cam_key] = latest
+        return {
+            "cam_id": cam_key,
+            "cached": True,
+            "points_detected": len(latest["points"]),
+        }
+
+    def clear_cached_homography(self, cam_id):
+        cam_key = self._cam_key(cam_id)
+        cleared = self.active_calibrations.pop(cam_key, None) is not None
+        return {"cam_id": cam_key, "cleared": cleared}
 
     def main(self, frame, cam_id: int):
         # Undistort first: the homography is a pinhole projective model, so
@@ -106,19 +222,36 @@ class FramePredict:
         # step operate in the (approximately) rectified pinhole view.
         frame = self._undistort(frame)
 
-        # Calibrate on every frame
-        top, left, right, bottom = self.detector.calibrate(frame)
+        cam_key = self._cam_key(cam_id)
+        active = self.active_calibrations.get(cam_key)
+        if active is not None:
+            mapper = active["mapper"]
+            annotated_frame, scores = self.predictor.process_frame(frame, cam_id, mapper)
+            return annotated_frame, scores
 
-        # The alignment markers sit on the outer edge of the double ring, so
-        # the board-plane radius they correspond to is exactly
-        # `double_outer_radius`. Using this value (rather than an average of
-        # pixel distances) keeps the homography consistent with the fixed
-        # scoring thresholds in `Dartboard`.
-        outer_radius = float(DartboardScorer.double_outer_radius)
+        calibration_points = self.detector.get_distinct_calibration_points(frame)
+        if len(calibration_points) < 4:
+            annotated_frame = frame.copy()
+            if calibration_points:
+                draw_calibration_points(annotated_frame, calibration_points)
+            self._annotate_status(
+                annotated_frame,
+                [
+                    f"Calibration markers found: {len(calibration_points)}/4",
+                    "No cached homography active",
+                ],
+            )
+            return annotated_frame, []
 
-        mapper = self._build_predictor(top, left, right, bottom, outer_radius)
-
-        annotated_frame, scores = self.predictor.process_frame(frame, cam_id)
+        top, left, right, bottom = order_calibration_points(calibration_points[:4])
+        outer_radius = self._outer_radius()
+        mapper = self._build_mapper(top, left, right, bottom, outer_radius)
+        self.latest_calibrations[cam_key] = {
+            "mapper": mapper,
+            "outer_radius": outer_radius,
+            "points": [deepcopy(p) for p in (top, left, right, bottom)],
+        }
+        annotated_frame, scores = self.predictor.process_frame(frame, cam_id, mapper)
 
         draw_calibration(
             frame=annotated_frame,
@@ -129,6 +262,9 @@ class FramePredict:
         )
 
         return annotated_frame, scores
+
+    def calibrate_frame(self, frame, cam_id):
+        return self._capture_calibration(frame, cam_id)
 
 
 # App setup
@@ -155,6 +291,13 @@ if not MODEL_PATH.exists():
     )
 
 predicter = FramePredict(str(MODEL_PATH))
+
+
+def encode_jpeg_response(frame, headers=None):
+    ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to encode annotated frame")
+    return Response(content=jpg.tobytes(), media_type="image/jpeg", headers=headers or {})
 
 
 # WebSocket: frame-based inference
@@ -256,6 +399,42 @@ async def upload_frame(cam_id: int, file: UploadFile = File(...)):
     )
     annotated_frame, scores = predicter.main(frame, cam_id)
     return {"scores": filter_reasonable_scores(scores)}
+
+
+@app.post("/calibration/frame")
+async def calibrate_frame(
+    file: UploadFile = File(...),
+    cam_id: str = Form("0"),
+):
+    image_bytes = await file.read()
+    frame = cv2.imdecode(
+        np.frombuffer(image_bytes, np.uint8),
+        cv2.IMREAD_COLOR
+    )
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Invalid frame payload")
+
+    annotated_frame, status = predicter.calibrate_frame(frame, cam_id)
+    headers = {
+        "X-Calibration-Cam-Id": status["cam_id"],
+        "X-Calibration-Points": str(status["points_detected"]),
+        "X-Calibration-Ready": "true" if status["homography_ready"] else "false",
+        "X-Calibration-Cache-Active": "true" if status["cache_active"] else "false",
+    }
+    return encode_jpeg_response(annotated_frame, headers=headers)
+
+
+@app.post("/calibration/cache")
+async def cache_latest_calibration(cam_id: str = Form("0")):
+    try:
+        return predicter.cache_latest_homography(cam_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/calibration/cache/clear")
+async def clear_cached_calibration(cam_id: str = Form("0")):
+    return predicter.clear_cached_homography(cam_id)
 
 
 # WebSocket: video file inference (OpenCV decodes server-side, bypasses browser codec limits)
