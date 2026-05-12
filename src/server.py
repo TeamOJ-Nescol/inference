@@ -134,7 +134,7 @@ class FramePredict:
         status = {
             "cam_id": cam_key,
             "points_detected": point_count,
-            "homography_ready": False,
+            "homography_ready": cam_key in self.latest_calibrations,
             "cache_active": cam_key in self.active_calibrations,
         }
 
@@ -157,6 +157,16 @@ class FramePredict:
             draw_calibration_points(annotated_frame, calibration_points)
 
         if snapshot is None:
+            if status["homography_ready"]:
+                self._annotate_status(
+                    annotated_frame,
+                    [
+                        f"Calibration markers found: {point_count}/4",
+                        "Latest valid homography still available to cache",
+                    ],
+                    ok=True,
+                )
+                return annotated_frame, status
             self._annotate_status(
                 annotated_frame,
                 [
@@ -230,6 +240,25 @@ class FramePredict:
         if active is not None:
             mapper = active["mapper"]
             annotated_frame, scores = self.predictor.process_frame(frame, cam_id, mapper)
+            top, left, right, bottom = active["points"]
+            draw_calibration(
+                frame=annotated_frame,
+                top=top,
+                left=left,
+                right=right,
+                bottom=bottom,
+                outer_radius=active["outer_radius"],
+                mapper=mapper,
+                board=self.board,
+            )
+            self._annotate_status(
+                annotated_frame,
+                [
+                    "Using cached homography",
+                    f"Cache key: {cam_key}",
+                ],
+                ok=True,
+            )
             return annotated_frame, scores
 
         calibration_points = self.detector.get_distinct_calibration_points(frame)
@@ -281,6 +310,12 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=[
+        "X-Calibration-Cam-Id",
+        "X-Calibration-Points",
+        "X-Calibration-Ready",
+        "X-Calibration-Cache-Active",
+    ],
 )
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
